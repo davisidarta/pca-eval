@@ -6,7 +6,6 @@ from scipy.spatial.distance import squareform
 from scipy.stats import spearmanr
 from scipy.sparse.csgraph import shortest_path
 from sklearn.datasets import make_classification, make_sparse_uncorrelated
-from sklearn.metrics import adjusted_rand_score
 from matplotlib import pyplot as plt
 try:
     import scanpy as sc
@@ -14,9 +13,26 @@ try:
 except ImportError:
     _HAS_SCANPY = False
 
-# Define stereotypical data
+try:
+    from topo.base.ann import kNN
+    _HAS_TOPO = True
+except ImportError:
+    _HAS_TOPO = False
+if _HAS_TOPO:
+    from topo.tpgraph.fuzzy import fuzzy_simplicial_set
 
+    def _fast_fuzzy_simplicial_set(X, n_neighbors=15, metric='euclidean', n_jobs=-1, verbose=False):
+        # that returns the kNN graph as well
+        knn = kNN(X, n_neighbors=n_neighbors, metric=metric,
+                  n_jobs=n_jobs, verbose=verbose)
+        fuzzy, sigmas, rhos = fuzzy_simplicial_set(
+            knn, n_neighbors=n_neighbors, n_jobs=n_jobs, metric='precomputed', verbose=verbose)
+        return fuzzy, knn
+
+# Define stereotypical data
 # Linearly correlated
+
+
 def generate_linear_data(n=1000, d=100, n_classes=10, redundancy=0.1, noise=0.1, seed=0):
     X, y = make_classification(
         n_samples=n, n_features=d, n_informative=int(redundancy*d), n_redundant=int((1-redundancy) * d), n_classes=n_classes, random_state=seed)
@@ -24,8 +40,9 @@ def generate_linear_data(n=1000, d=100, n_classes=10, redundancy=0.1, noise=0.1,
     X += noise * rng.uniform(size=X.shape)
     return X
 
-
 # Uncorrelated
+
+
 def generate_uncorrelated_data(n=1000, d=100, seed=0):
     X, y = make_sparse_uncorrelated(
         n_samples=n, n_features=d, random_state=seed)
@@ -42,6 +59,8 @@ def geodesic_distance(data, method='D', unweighted=False, directed=True):
     return G
 
 # Score metrics from TopOMetry
+def graph_spearman_r(data_graph, pca_grap):
+    res, _ = spearmanr(squareform(data_graph), squareform(pca_grap))
 
 
 def knn_spearman_r(data_graph, embedding_graph, path_method='D', subsample_idx=None, unweighted=True):
@@ -77,21 +96,35 @@ if _HAS_SCANPY:
             print('...done!')
         return AnnData.copy()
 
-    def process(AnnData, pca=True, verbose=False, **kwargs):
+    def process(AnnData, pca=True, n_pcs=100, n_neighbors=10, metric='euclidean', n_jobs=-1, verbose=False, **kwargs):
         if verbose:
             print('Processing...')
         if pca:
-            if AnnData.obsm['X_pca'] is None:
-                sc.tl.pca(AnnData, n_comps=100)
-            sc.pp.neighbors(AnnData, n_neighbors=15,
-                            n_pcs=100, key_added='PCA_kNN')
+            if 'X_pca' not in AnnData.obsm.keys():
+                sc.tl.pca(AnnData, n_comps=n_pcs)
+            # if _HAS_TOPO:
+            #     AnnData.obsp['PCA_kNN_connectivities'], \
+            #         AnnData.obsp['PCA_kNN_distances'] = _fast_fuzzy_simplicial_set(AnnData.obsm['X_pca'],
+            #                                                                        n_neighbors=n_neighbors,
+            #                                                                        metric=metric,
+            #                                                                        n_jobs=n_jobs)
+            # else:
+            #     sc.pp.neighbors(AnnData, n_neighbors=n_neighbors, n_pcs=n_pcs, key_added='PCA_kNN')
+            sc.pp.neighbors(AnnData, n_neighbors=n_neighbors, n_pcs=n_pcs, key_added='PCA_kNN')                                                                    
             sc.tl.leiden(AnnData, key_added='PCA_kNN_leiden',
                          neighbors_key='PCA_kNN')
             sc.tl.umap(AnnData, neighbors_key='PCA_kNN', **kwargs)
             AnnData.obsm['X_UMAP_on_PCA'] = AnnData.obsm['X_umap']
         else:
-            sc.pp.neighbors(AnnData, n_neighbors=15,
-                            use_rep='X', key_added='Data_kNN')
+            # if _HAS_TOPO:
+            #     AnnData.obsp['Data_kNN_connectivities'], \
+            #         AnnData.obsp['Data_kNN_distances'] = _fast_fuzzy_simplicial_set(AnnData.X,
+            #                                                                        n_neighbors=n_neighbors,
+            #                                                                        metric=metric,
+            #                                                                        n_jobs=n_jobs)
+            # else:
+            #     sc.pp.neighbors(AnnData, n_neighbors=n_neighbors, use_rep='X', key_added='Data_kNN')
+            sc.pp.neighbors(AnnData, n_neighbors=n_neighbors, use_rep='X', key_added='Data_kNN')                                                                    
             sc.tl.leiden(AnnData, key_added='Data_kNN_leiden',
                          neighbors_key='Data_kNN')
             sc.tl.umap(AnnData, neighbors_key='Data_kNN', **kwargs)
@@ -108,12 +141,13 @@ if _HAS_SCANPY:
         pca_Y = pca.fit_transform(AnnData.X)
         AnnData.obsm['X_pca'] = pca_Y
         # With PCA
-        AnnData = process(AnnData, pca=True, **kwargs)
+        AnnData = process(AnnData, pca=True, n_neighbors=n_neighbors, **kwargs)
         # Without PCA
-        AnnData = process(AnnData, pca=False, **kwargs)
+        AnnData = process(AnnData, pca=False,
+                          n_neighbors=n_neighbors, **kwargs)
         # Compute scores
-        pca_graph = AnnData.obsp['PCA_kNN_distances']
-        data_graph = AnnData.obsp['Data_kNN_distances']
+        pca_graph = AnnData.obsp['PCA_kNN_connectivities']
+        data_graph = AnnData.obsp['Data_kNN_connectivities']
         umap_on_pca_graph = kneighbors_graph(
             AnnData.obsm['X_UMAP_on_PCA'], n_neighbors=n_neighbors, mode='distance', metric=metric)
         umap_on_data_graph = kneighbors_graph(
@@ -122,8 +156,7 @@ if _HAS_SCANPY:
                         'singular_values': pca.singular_values_,
                         'explained_variance': pca.explained_variance_ratio_.cumsum(),
                         'graph_correlation': knn_spearman_r(pca_graph, data_graph),
-                        'embedding_correlation': knn_spearman_r(umap_on_pca_graph, umap_on_data_graph),
-                        'adjusted_rand_score': adjusted_rand_score(AnnData.obs['PCA_kNN_leiden'].astype(int).values, AnnData.obs['Data_kNN_leiden'].astype(int).values)}
+                        'embedding_correlation': knn_spearman_r(umap_on_pca_graph, umap_on_data_graph)}
         gc.collect()
         return results_dict, AnnData.copy()
 
@@ -134,18 +167,21 @@ if _HAS_SCANPY:
             explained_vars = []
             graph_correlation = []
             embedding_correlation = []
-            ari = []
+            cluster_score_pca = []
+            cluster_score_data = []
         else:
             results_dict = {}
         if save_intermediate:
             if save_dir is None:
                 raise ValueError('Save directory not specified!')
         for i in range(len(adata_files)):
+            if verbose:
+                print('Processing file {} of {}'.format(i+1, len(adata_files)))
             adata = sc.read_h5ad(adata_files[i])
             if not_normalize_idx is not None:
                 if i in not_normalize_idx:
                     adata = preprocess(adata, norm_log=False,
-                                       verbose=verbose, **kwargs)
+                                       verbose=verbose)
                 else:
                     adata = preprocess(adata, min_mean=0.0125,
                                        max_mean=3, min_disp=0.5)
@@ -167,8 +203,8 @@ if _HAS_SCANPY:
                 adata.write_h5ad(save_dir + 'processed_' +
                                  adata_files[i].split('/')[-1])
             # Compute scores
-            pca_graph = adata.obsp['PCA_kNN_distances']
-            data_graph = adata.obsp['Data_kNN_distances']
+            pca_graph = adata.obsp['PCA_kNN_connectivities']
+            data_graph = adata.obsp['Data_kNN_connectivities']
             umap_on_pca_graph = kneighbors_graph(
                 adata.obsm['X_UMAP_on_PCA'], n_neighbors=n_neighbors, mode='distance', metric=metric)
             umap_on_data_graph = kneighbors_graph(
@@ -177,39 +213,34 @@ if _HAS_SCANPY:
                 graph_correlation.append(knn_spearman_r(pca_graph, data_graph))
                 embedding_correlation.append(knn_spearman_r(
                     umap_on_pca_graph, umap_on_data_graph))
-                ari.append(adjusted_rand_score(AnnData.obs['PCA_kNN_leiden'].astype(int).values, AnnData.obs['Data_kNN_leiden'].astype(int).values))
             else:
-                results_dict[str(adata_files[i].split('/')[-1])] = {'PCA_estimator': pca,
-                                                                    'singular_values': pca.singular_values_,
-                                                                    'explained_variance': pca.explained_variance_ratio_.cumsum(),
-                                                                    'graph_correlation': knn_spearman_r(pca_graph, data_graph),
-                                                                    'embedding_correlation': knn_spearman_r(umap_on_pca_graph, umap_on_data_graph),
-                                                                    'adjusted_rand_score': adjusted_rand_score(AnnData.obs['PCA_kNN_leiden'].astype(int).values, AnnData.obs['Data_kNN_leiden'].astype(int).values)}
+                results_dict[str(adata_files[i].split('/')[-1])[:-5]] = {'PCA_estimator': pca,
+                                                                         'singular_values': pca.singular_values_,
+                                                                         'explained_variance': pca.explained_variance_ratio_.cumsum(),
+                                                                         'graph_correlation': knn_spearman_r(pca_graph, data_graph),
+                                                                         'embedding_correlation': knn_spearman_r(umap_on_pca_graph, umap_on_data_graph)}
+            del adata
             gc.collect()
             if verbose:
                 print('Done with file: ' + adata_files[i])
         if not return_dict:
-            return pca_estimators, sin_vals, explained_vars, graph_correlation, embedding_correlation, ari
+            return pca_estimators, sin_vals, explained_vars, graph_correlation, embedding_correlation, cluster_score_pca, cluster_score_data
         else:
             return results_dict
-
 
 
 def print_dict_results(results_dict):
     for i, dataset_name in enumerate(results_dict):
         print('\n \n  --- ' + str(dataset_name) + ' --- ' +
-    '\n Spearman R correlation between the k-nearest-neighbors graphs learned from the data and the Principal Components: %f'%results_dict['graph_correlation'] +
-    '\n Spearman R correlation between the geodesic distances in UMAP embeddings learned from these graphs %f'%results_dict['embedding_correlation'] +
-    '\n Total explained variance with the first 100 PCs: %f'%results_dict['explained_variance'].max() +
-    '\n Adjusted rand index (ARI) between clustering on top 100 PCs and on full data: %f'%results_dict['adjusted_rand_score'])
-
+              '\n Spearman R correlation between the k-nearest-neighbors graphs learned from the data and the Principal Components: %f' % results_dict[dataset_name]['graph_correlation'] +
+              '\n Spearman R correlation between the geodesic distances in UMAP embeddings learned from these graphs %f' % results_dict[dataset_name]['embedding_correlation'] +
+              '\n Total explained variance with the first 100 PCs: %f' % results_dict[dataset_name]['explained_variance'].max())
 
 
 # Function for evaluating generic numpy data array
-def evaluate_matrix(X, n_pcs=100, dimred_estimator=None, clustering_estimator=None, precomputed_knn=None, metric='euclidean', n_neighbors=15, n_jobs=1, verbose=False, **kwargs):
+def evaluate_matrix(X, n_pcs=100, dimred_estimator=None, precomputed_knn=None, metric='euclidean', n_neighbors=15, n_jobs=1, verbose=False, **kwargs):
     results_dict = {}
     _skip_dimred = False
-    _skip_clustering = False
     pca = PCA(n_components=n_pcs)
     pca_Y = pca.fit_transform(X)
     if precomputed_knn is None:
@@ -242,36 +273,22 @@ def evaluate_matrix(X, n_pcs=100, dimred_estimator=None, clustering_estimator=No
             dimred_on_pca_graph, dimred_on_data_graph)
     else:
         embedding_correlation = None
-    if isinstance(clustering_estimator, bool):
-        if not clustering_estimator:
-            _skip_clustering = True
-    if not _skip_clustering:
-        if clustering_estimator is None:
-            if verbose:
-                print(
-                    'No clustering estimator specified, using scikit-learn Affinity Propagation...')
-            from sklearn.cluster import AffinityPropagation
-            clustering_estimator = AffinityPropagation(
-                affinity='precomputed', verbose=verbose)
-        clustering_pca = clustering_estimator.fit_predict(pca_graph)
-        clustering_data = clustering_estimator.fit_predict(data_graph)
-        ari = adjusted_rand_score(clustering_pca, clustering_data)
-    else:
-        ari = None
     results_dict = {'PCA_estimator': pca,
                     'singular_values': pca.singular_values_,
                     'explained_variance': pca.explained_variance_ratio_.cumsum(),
                     'graph_correlation': knn_spearman_r(pca_graph, data_graph),
-                    'embedding_correlation': embedding_correlation,
-                    'adjusted_rand_score': ari}
+                    'embedding_correlation': embedding_correlation}
     return results_dict
 
 # Plotting functions
+
+
 def plot_sing_vals_exp_var(results_dict, dataset=None, fontsize=16, figsize=(8, 4), **kwargs):
     # If no dataset is specified, plot for all datasets
     if isinstance(dataset, bool):
         plt.figure(figsize=figsize)
-        plt.subplots_adjust(left=0.2, right=0.98, bottom=0.001, top=0.9, wspace=0.15, hspace=0.01)
+        plt.subplots_adjust(left=0.2, right=0.98, bottom=0.001,
+                            top=0.9, wspace=0.15, hspace=0.01)
         if not dataset:
             plt.subplot(1, 2, 1)
             _plot_singular_values(
@@ -282,7 +299,8 @@ def plot_sing_vals_exp_var(results_dict, dataset=None, fontsize=16, figsize=(8, 
             plt.tight_layout()
     elif dataset is not None:
         plt.figure(figsize=figsize)
-        plt.subplots_adjust(left=0.2, right=0.98, bottom=0.001, top=0.9, wspace=0.15, hspace=0.01)
+        plt.subplots_adjust(left=0.2, right=0.98, bottom=0.001,
+                            top=0.9, wspace=0.15, hspace=0.01)
         if not isinstance(dataset, str):
             raise ValueError('dataset must be a string!')
         if dataset not in results_dict.keys():
@@ -298,16 +316,19 @@ def plot_sing_vals_exp_var(results_dict, dataset=None, fontsize=16, figsize=(8, 
     else:
         for i, dataset_name in enumerate(results_dict):
             plt.figure(figsize=figsize)
-            plt.subplots_adjust(left=0.2, right=0.98, bottom=0.001, top=0.9, wspace=0.15, hspace=0.01)
+            plt.subplots_adjust(left=0.2, right=0.98,
+                                bottom=0.001, top=0.9, wspace=0.15, hspace=0.01)
             plt.suptitle(dataset_name, fontsize=fontsize+4)
             plt.subplot(1, 2, 1)
-            plt.plot(range(0, len(results_dict[dataset_name]['singular_values'])), results_dict[dataset_name]['singular_values'], marker='o', **kwargs)
+            plt.plot(range(0, len(results_dict[dataset_name]['singular_values'])),
+                     results_dict[dataset_name]['singular_values'], marker='o', **kwargs)
             plt.xlabel('Number of PCs', fontsize=fontsize)
             plt.ylabel('Singular values', fontsize=fontsize)
             plt.subplot(1, 2, 2)
-            plt.plot(range(0, len(results_dict[dataset_name]['explained_variance'])), results_dict[dataset_name]['explained_variance'], marker='o', **kwargs)
+            plt.plot(range(0, len(results_dict[dataset_name]['explained_variance'])),
+                     results_dict[dataset_name]['explained_variance'], marker='o', **kwargs)
             plt.xlabel('Number of PCs', fontsize=fontsize)
-            plt.ylabel('Cumulative explained variance', fontsize=fontsize)
+            plt.ylabel('Total explained variance', fontsize=fontsize)
             plt.tight_layout()
             plt.show()
 
@@ -321,4 +342,4 @@ def _plot_singular_values(sin_vals, fontsize=13, **kwargs):
 def _plot_explained_variance(exp_var, fontsize=13, **kwargs):
     plt.plot(range(0, len(exp_var)), exp_var, marker='o', **kwargs)
     plt.xlabel('Number of PCs', fontsize=fontsize)
-    plt.ylabel('Cumulative explained variance', fontsize=fontsize)
+    plt.ylabel('Total explained variance', fontsize=fontsize)
