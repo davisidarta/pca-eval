@@ -5,34 +5,24 @@ from sklearn.neighbors import kneighbors_graph
 from scipy.spatial.distance import squareform
 from scipy.stats import spearmanr
 from scipy.sparse.csgraph import shortest_path
+from scipy.sparse import issparse
 from sklearn.datasets import make_classification, make_sparse_uncorrelated
 from matplotlib import pyplot as plt
+from umap.umap_ import UMAP
 try:
     import scanpy as sc
     _HAS_SCANPY = True
 except ImportError:
     _HAS_SCANPY = False
-
 try:
-    from topo.base.ann import kNN
+    import topo as tp
     _HAS_TOPO = True
 except ImportError:
     _HAS_TOPO = False
-if _HAS_TOPO:
-    from topo.tpgraph.fuzzy import fuzzy_simplicial_set
 
-    def _fast_fuzzy_simplicial_set(X, n_neighbors=15, metric='euclidean', n_jobs=-1, verbose=False):
-        # that returns the kNN graph as well
-        knn = kNN(X, n_neighbors=n_neighbors, metric=metric,
-                  n_jobs=n_jobs, verbose=verbose)
-        fuzzy, sigmas, rhos = fuzzy_simplicial_set(
-            knn, n_neighbors=n_neighbors, n_jobs=n_jobs, metric='precomputed', verbose=verbose)
-        return fuzzy, knn
 
 # Define stereotypical data
 # Linearly correlated
-
-
 def generate_linear_data(n=1000, d=100, n_classes=10, redundancy=0.1, noise=0.1, seed=0):
     X, y = make_classification(
         n_samples=n, n_features=d, n_informative=int(redundancy*d), n_redundant=int((1-redundancy) * d), n_classes=n_classes, random_state=seed)
@@ -41,8 +31,6 @@ def generate_linear_data(n=1000, d=100, n_classes=10, redundancy=0.1, noise=0.1,
     return X
 
 # Uncorrelated
-
-
 def generate_uncorrelated_data(n=1000, d=100, seed=0):
     X, y = make_sparse_uncorrelated(
         n_samples=n, n_features=d, random_state=seed)
@@ -58,10 +46,17 @@ def geodesic_distance(data, method='D', unweighted=False, directed=True):
     G[(np.arange(G.shape[0]), np.arange(G.shape[0]))] = 0
     return G
 
+def symmetrize(knn):
+    knn = (knn + knn.T)/2
+    knn[(np.arange(knn.shape[0]), np.arange(knn.shape[0]))] = 0
+    if issparse(knn):
+        knn = knn.toarray()
+    return knn
+
 # Score metrics from TopOMetry
 def graph_spearman_r(data_graph, pca_grap):
-    res, _ = spearmanr(squareform(data_graph), squareform(pca_grap))
-
+    res, _ = spearmanr(squareform(symmetrize(data_graph)), squareform(symmetrize(pca_grap)))
+    return res
 
 def knn_spearman_r(data_graph, embedding_graph, path_method='D', subsample_idx=None, unweighted=True):
     # data_graph is a (N,N) similarity matrix from the reference high-dimensional data
@@ -90,77 +85,63 @@ if _HAS_SCANPY:
             sc.pp.normalize_total(AnnData, target_sum=1e4)
             sc.pp.log1p(AnnData)
         sc.pp.highly_variable_genes(AnnData, **kwargs)
+        AnnData.raw = AnnData
         AnnData = AnnData[:, AnnData.var['highly_variable']].copy()
         sc.pp.scale(AnnData, max_value=10)
         if verbose:
             print('...done!')
         return AnnData.copy()
 
-    def process(AnnData, pca=True, n_pcs=100, n_neighbors=10, metric='euclidean', n_jobs=-1, verbose=False, **kwargs):
+    def process(AnnData, n_pcs=100, n_neighbors=10, metric='cosine', n_jobs=-1, verbose=False, **kwargs):
         if verbose:
             print('Processing...')
-        if pca:
-            if 'X_pca' not in AnnData.obsm.keys():
-                sc.tl.pca(AnnData, n_comps=n_pcs)
-            # if _HAS_TOPO:
-            #     AnnData.obsp['PCA_kNN_connectivities'], \
-            #         AnnData.obsp['PCA_kNN_distances'] = _fast_fuzzy_simplicial_set(AnnData.obsm['X_pca'],
-            #                                                                        n_neighbors=n_neighbors,
-            #                                                                        metric=metric,
-            #                                                                        n_jobs=n_jobs)
-            # else:
-            #     sc.pp.neighbors(AnnData, n_neighbors=n_neighbors, n_pcs=n_pcs, key_added='PCA_kNN')
-            sc.pp.neighbors(AnnData, n_neighbors=n_neighbors, n_pcs=n_pcs, key_added='PCA_kNN')                                                                    
-            sc.tl.leiden(AnnData, key_added='PCA_kNN_leiden',
-                         neighbors_key='PCA_kNN')
-            sc.tl.umap(AnnData, neighbors_key='PCA_kNN', **kwargs)
-            AnnData.obsm['X_UMAP_on_PCA'] = AnnData.obsm['X_umap']
-        else:
-            # if _HAS_TOPO:
-            #     AnnData.obsp['Data_kNN_connectivities'], \
-            #         AnnData.obsp['Data_kNN_distances'] = _fast_fuzzy_simplicial_set(AnnData.X,
-            #                                                                        n_neighbors=n_neighbors,
-            #                                                                        metric=metric,
-            #                                                                        n_jobs=n_jobs)
-            # else:
-            #     sc.pp.neighbors(AnnData, n_neighbors=n_neighbors, use_rep='X', key_added='Data_kNN')
-            sc.pp.neighbors(AnnData, n_neighbors=n_neighbors, use_rep='X', key_added='Data_kNN')                                                                    
-            sc.tl.leiden(AnnData, key_added='Data_kNN_leiden',
-                         neighbors_key='Data_kNN')
-            sc.tl.umap(AnnData, neighbors_key='Data_kNN', **kwargs)
-            AnnData.obsm['X_UMAP_on_Data'] = AnnData.obsm['X_umap']
+        if 'X_pca' not in AnnData.obsm.keys():
+            sc.tl.pca(AnnData, n_comps=n_pcs)
+        # PCA derived
+        umapper_pca = UMAP(n_neighbors=n_neighbors, metric=metric, n_jobs=n_jobs, **kwargs).fit(AnnData.obsm['X_pca'][:, :n_pcs])
+        umap_pca = umapper_pca.transform(AnnData.obsm['X_pca'][:, :n_pcs])
+        umap_pca_graph = umapper_pca.graph_
+        AnnData.obsp['PCA_kNN_connectivities'] = umap_pca_graph
+        AnnData.obsm['X_UMAP_on_PCA'] = umap_pca
+        sc.tl.leiden(AnnData, resolution=0.8, directed=False, key_added='PCA_kNN_leiden', adjacency=umap_pca_graph)
+        # Data-derived; UMAP does not like scaled data
+        ad_for_umap = AnnData.raw.to_adata()
+        ad_for_umap = ad_for_umap[:, ad_for_umap.var['highly_variable']].copy()
+        umapper_data = UMAP(n_neighbors=n_neighbors, metric=metric, n_jobs=n_jobs, **kwargs).fit(ad_for_umap.X)
+        umap_data = umapper_data.transform(ad_for_umap.X)
+        umap_data_graph = umapper_data.graph_
+        AnnData.obsp['Data_kNN_connectivities'] = umap_data_graph
+        AnnData.obsm['X_UMAP_on_Data'] = umap_data
+        sc.tl.leiden(AnnData, resolution=0.8, directed=False, key_added='Data_kNN_leiden', adjacency=umap_data_graph)
         if verbose:
             print('...done!')
         return AnnData.copy()
 
-    def evaluate_anndata(AnnData, norm_log_hvg=True, n_pcs=100, metric='euclidean', n_neighbors=15, verbose=False, **kwargs):
-        if norm_log_hvg:
+    def evaluate_anndata(AnnData, preprocessed=False, processed=False, n_pcs=100, metric='euclidean', n_neighbors=10, n_jobs=-1, verbose=False, **kwargs):
+        if not preprocessed:
             AnnData = preprocess(AnnData, norm_log=True,
-                                 verbose=verbose, **kwargs)
+                                 verbose=verbose)
         pca = PCA(n_components=n_pcs)
         pca_Y = pca.fit_transform(AnnData.X)
         AnnData.obsm['X_pca'] = pca_Y
-        # With PCA
-        AnnData = process(AnnData, pca=True, n_neighbors=n_neighbors, **kwargs)
-        # Without PCA
-        AnnData = process(AnnData, pca=False,
-                          n_neighbors=n_neighbors, **kwargs)
+        if not processed:
+            AnnData = process(AnnData, n_neighbors=n_neighbors, n_jobs=n_jobs, **kwargs)
         # Compute scores
         pca_graph = AnnData.obsp['PCA_kNN_connectivities']
         data_graph = AnnData.obsp['Data_kNN_connectivities']
         umap_on_pca_graph = kneighbors_graph(
-            AnnData.obsm['X_UMAP_on_PCA'], n_neighbors=n_neighbors, mode='distance', metric=metric)
+            AnnData.obsm['X_UMAP_on_PCA'], n_neighbors=n_neighbors, n_jobs=n_jobs, mode='distance', metric=metric)
         umap_on_data_graph = kneighbors_graph(
-            AnnData.obsm['X_UMAP_on_Data'], n_neighbors=n_neighbors, mode='distance', metric=metric)
+            AnnData.obsm['X_UMAP_on_Data'], n_neighbors=n_neighbors, n_jobs=n_jobs, mode='distance', metric=metric)
         results_dict = {'PCA_estimator': pca,
                         'singular_values': pca.singular_values_,
                         'explained_variance': pca.explained_variance_ratio_.cumsum(),
-                        'graph_correlation': knn_spearman_r(pca_graph, data_graph),
-                        'embedding_correlation': knn_spearman_r(umap_on_pca_graph, umap_on_data_graph)}
+                        'graph_correlation': graph_spearman_r(pca_graph, data_graph),
+                        'embedding_correlation': graph_spearman_r(umap_on_pca_graph, umap_on_data_graph)}
         gc.collect()
         return results_dict, AnnData.copy()
 
-    def evaluate_anndata_file_list(adata_files, n_pcs=100, metric='euclidean', n_neighbors=15, save_intermediate=False, save_dir=None, verbose=False,  not_normalize_idx=None, return_dict=True, **kwargs):
+    def evaluate_anndata_file_list(adata_files, n_pcs=100, metric='euclidean', n_neighbors=5, save_intermediate=False, save_dir=None, verbose=False,  not_normalize_idx=None, return_dict=True, **kwargs):
         if not return_dict:
             pca_estimators = []
             sin_vals = []
@@ -210,15 +191,15 @@ if _HAS_SCANPY:
             umap_on_data_graph = kneighbors_graph(
                 adata.obsm['X_UMAP_on_Data'], n_neighbors=n_neighbors, mode='distance', metric=metric)
             if not return_dict:
-                graph_correlation.append(knn_spearman_r(pca_graph, data_graph))
-                embedding_correlation.append(knn_spearman_r(
+                graph_correlation.append(graph_spearman_r(pca_graph, data_graph))
+                embedding_correlation.append(graph_spearman_r(
                     umap_on_pca_graph, umap_on_data_graph))
             else:
                 results_dict[str(adata_files[i].split('/')[-1])[:-5]] = {'PCA_estimator': pca,
                                                                          'singular_values': pca.singular_values_,
                                                                          'explained_variance': pca.explained_variance_ratio_.cumsum(),
-                                                                         'graph_correlation': knn_spearman_r(pca_graph, data_graph),
-                                                                         'embedding_correlation': knn_spearman_r(umap_on_pca_graph, umap_on_data_graph)}
+                                                                         'graph_correlation': graph_spearman_r(pca_graph, data_graph),
+                                                                         'embedding_correlation': graph_spearman_r(umap_on_pca_graph, umap_on_data_graph)}
             del adata
             gc.collect()
             if verbose:
@@ -233,12 +214,12 @@ def print_dict_results(results_dict):
     for i, dataset_name in enumerate(results_dict):
         print('\n \n  --- ' + str(dataset_name) + ' --- ' +
               '\n Spearman R correlation between the k-nearest-neighbors graphs learned from the data and the Principal Components: %f' % results_dict[dataset_name]['graph_correlation'] +
-              '\n Spearman R correlation between the geodesic distances in UMAP embeddings learned from these graphs %f' % results_dict[dataset_name]['embedding_correlation'] +
+              '\n Spearman R correlation between the UMAP embeddings learned from these graphs %f' % results_dict[dataset_name]['embedding_correlation'] +
               '\n Total explained variance with the first 100 PCs: %f' % results_dict[dataset_name]['explained_variance'].max())
 
 
 # Function for evaluating generic numpy data array
-def evaluate_matrix(X, n_pcs=100, dimred_estimator=None, precomputed_knn=None, metric='euclidean', n_neighbors=15, n_jobs=1, verbose=False, **kwargs):
+def evaluate_matrix(X, n_pcs=100, dimred_estimator=None, precomputed_knn=None, metric='euclidean', n_neighbors=5, n_jobs=1, verbose=False, **kwargs):
     results_dict = {}
     _skip_dimred = False
     pca = PCA(n_components=n_pcs)
@@ -251,32 +232,29 @@ def evaluate_matrix(X, n_pcs=100, dimred_estimator=None, precomputed_knn=None, m
     else:
         data_graph = precomputed_knn
     pca_graph = kneighbors_graph(
-        pca_Y, n_neighbors=n_neighbors, mode='distance', metric=metric, n_jobs=n_jobs)
+        pca_Y[:, :n_pcs], n_neighbors=n_neighbors, mode='distance', metric=metric, n_jobs=n_jobs)
     if isinstance(dimred_estimator, bool):
         if not dimred_estimator:
             _skip_dimred = True
     if not _skip_dimred:
         if dimred_estimator is None:
             if verbose:
-                print('No non-linear dimensionality reduction estimator specified, using scikit-learn t-SNE...'
-                      'This may take a while...')
-            from sklearn.manifold import TSNE
-            dimred_estimator = TSNE(n_components=2, perplexity=30,
-                                    metric='precomputed', init=pca_Y, n_iter=1000, verbose=verbose)
-        dim_red_Y = dimred_estimator.fit_transform(data_graph)
-        dim_red_with_PCA_Y = dimred_estimator.fit_transform(pca_graph)
+                print('No non-linear dimensionality reduction estimator specified, using UMAP...')
+            dimred_estimator = UMAP(n_neighbors=n_neighbors, metric=metric, verbose=verbose)
+        dim_red_Y = dimred_estimator.fit_transform(X)
+        dim_red_with_PCA_Y = dimred_estimator.fit_transform(pca_Y[:, :n_pcs])
         dimred_on_data_graph = kneighbors_graph(
             dim_red_Y, n_neighbors=n_neighbors, mode='distance', metric=metric, n_jobs=n_jobs)
         dimred_on_pca_graph = kneighbors_graph(
             dim_red_with_PCA_Y, n_neighbors=n_neighbors, mode='distance', metric=metric, n_jobs=n_jobs)
-        embedding_correlation = knn_spearman_r(
+        embedding_correlation = graph_spearman_r(
             dimred_on_pca_graph, dimred_on_data_graph)
     else:
-        embedding_correlation = None
+        embedding_correlation = 0
     results_dict = {'PCA_estimator': pca,
                     'singular_values': pca.singular_values_,
                     'explained_variance': pca.explained_variance_ratio_.cumsum(),
-                    'graph_correlation': knn_spearman_r(pca_graph, data_graph),
+                    'graph_correlation': graph_spearman_r(pca_graph, data_graph),
                     'embedding_correlation': embedding_correlation}
     return results_dict
 
